@@ -18,8 +18,10 @@ package scss
 import (
 	"fmt"
 	"io"
+	"os"
 	"path"
 	"path/filepath"
+	"slices"
 	"strings"
 
 	"github.com/bep/golibsass/libsass"
@@ -78,22 +80,20 @@ func (t *toCSSTransformation) Transform(ctx *resources.ResourceTransformationCtx
 		url = filepath.FromSlash(url)
 		prev = filepath.FromSlash(prev)
 
-		var basePath string
-		urlDir := filepath.Dir(url)
-		var prevDir string
+		var (
+			prevDir string
+			inHugo  = true
+			osDirs  = options.to.IncludePaths
+		)
 
 		if prev == "stdin" {
 			prevDir = baseDir
 		} else {
-			prevDir, _ = t.c.sfs.MakePathRelative(filepath.Dir(prev), true)
-
-			if prevDir == "" {
-				// Not a member of this filesystem. Let LibSASS handle it.
-				return "", "", false
-			}
+			prevDir, inHugo = t.c.sfs.MakePathRelative(filepath.Dir(prev), true)
+			osDirs = append([]string{filepath.Dir(prev)}, osDirs...)
 		}
 
-		basePath = filepath.Join(prevDir, urlDir)
+		urlDir := filepath.Dir(url)
 		name := filepath.Base(url)
 
 		// Libsass throws an error in cases where you have several possible candidates.
@@ -113,19 +113,64 @@ func (t *toCSSTransformation) Transform(ctx *resources.ResourceTransformationCtx
 		}
 
 		name = strings.TrimPrefix(name, "_")
+		names := make([]string, len(namePatterns))
+		for i, namePattern := range namePatterns {
+			names[i] = filepath.Join(urlDir, fmt.Sprintf(namePattern, name))
+		}
 
-		for _, namePattern := range namePatterns {
-			filenameToCheck := filepath.Join(basePath, fmt.Sprintf(namePattern, name))
-			fi, err := t.c.sfs.Fs.Stat(filenameToCheck)
-			if err == nil {
-				if fim, ok := fi.(hugofs.FileMetaInfo); ok {
-					ctx.DependencyManager.AddIdentity(identity.CleanStringIdentity(filenameToCheck))
-					return fim.Meta().Filename, "", true
+		if inHugo {
+			for _, n := range names {
+				filenameToCheck := filepath.Join(prevDir, n)
+				fi, err := t.c.sfs.Fs.Stat(filenameToCheck)
+				if err == nil {
+					if fim, ok := fi.(hugofs.FileMetaInfo); ok {
+						ctx.DependencyManager.AddIdentity(identity.CleanStringIdentity(filenameToCheck))
+						return fim.Meta().Filename, "", true
+					}
 				}
 			}
 		}
 
-		// Not found, let LibSASS handle it
+		// Not found in Hugo's file systems. LibSASS would now search relative to prev
+		// and the include paths on its own, so do that here where the result can be checked.
+		filename, err := sass.FindFile(t.c.rs.ExecHelper, osDirs, names)
+		if err != nil {
+			// The resolver cannot return an error, but @error fails the build.
+			return url, fmt.Sprintf("@error %q;", err.Error()), true
+		}
+		if filename != "" {
+			return filename, "", true
+		}
+
+		// LibSASS also searches relative to the current working directory (for the
+		// entry file) and tries more candidates than the above (e.g. .css and
+		// extensionless files). Do that here, too, so the result can be checked, and
+		// hand LibSASS the import anchored to the directory it was found in, so it
+		// resolves the same file and nested imports are relative to its real path.
+		// Imports of .css files are kept as plain CSS imports by LibSASS.
+		if false && !strings.HasSuffix(url, ".css") {
+			libSassDirs := osDirs
+			if prev == "stdin" {
+				if wd, err := os.Getwd(); err == nil {
+					libSassDirs = append([]string{wd}, osDirs...)
+				}
+			}
+			candidates := libSassCandidates(url)
+			for _, dir := range libSassDirs {
+				filename, err := sass.FindFile(t.c.rs.ExecHelper, []string{dir}, candidates)
+				if err != nil {
+					return url, fmt.Sprintf("@error %q;", err.Error()), true
+				}
+				if filename != "" {
+					if filepath.IsAbs(url) || strings.HasPrefix(url, string(filepath.Separator)) {
+						return url, "", true
+					}
+					return filepath.Join(dir, url), "", true
+				}
+			}
+		}
+
+		// Not found, let LibSASS report it.
 		return "", "", false
 	}
 
@@ -213,4 +258,29 @@ func (c *Client) toCSS(options libsass.Options, dst io.Writer, src io.Reader) (l
 	_, err = io.WriteString(dst, out)
 
 	return res, err
+}
+
+// libSassCandidates returns the file names LibSASS tries, in order, when it
+// resolves an import of url on its own (see resolve_includes in LibSASS).
+func libSassCandidates(url string) []string {
+	dir, name := filepath.Dir(url), filepath.Base(url)
+	exts := []string{".scss", ".sass", ".css"}
+	candidates := []string{name, "_" + name}
+	for _, ext := range exts {
+		candidates = append(candidates, "_"+name+ext)
+	}
+	for _, ext := range exts {
+		candidates = append(candidates, name+ext)
+	}
+	if !slices.Contains(exts, filepath.Ext(name)) {
+		for _, index := range []string{"_index", "index"} {
+			for _, ext := range exts {
+				candidates = append(candidates, filepath.Join(name, index+ext))
+			}
+		}
+	}
+	for i, c := range candidates {
+		candidates[i] = filepath.Join(dir, c)
+	}
+	return candidates
 }
